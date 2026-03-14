@@ -1,0 +1,211 @@
+version: "3.8"
+
+# ============================================================================
+# Enterprise AI Inspection Knowledge Assistant
+# ============================================================================
+# Reuses existing containers: grafana, prometheus, qdrant
+# (running on the "observability_default" Docker network)
+#
+# New services: n8n, PostgreSQL, Redis, Pushgateway, Reranker, Qdrant-Init
+# ============================================================================
+
+x-common-env: &common-env
+  TZ: UTC
+
+services:
+  # --------------------------------------------------------------------------
+  # n8n - Workflow Engine
+  # --------------------------------------------------------------------------
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      <<: *common-env
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: ${N8N_HOST:-0.0.0.0}
+      N8N_PORT: ${N8N_PORT:-5678}
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678}
+      N8N_BASIC_AUTH_ACTIVE: ${N8N_BASIC_AUTH_ACTIVE:-true}
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:-changeme}
+      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL:-info}
+      EXECUTIONS_DATA_SAVE_ON_ERROR: ${EXECUTIONS_DATA_SAVE_ON_ERROR:-all}
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: ${EXECUTIONS_DATA_SAVE_ON_SUCCESS:-all}
+      EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: "true"
+      # Database backend for n8n internal state
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-enterprise_ai}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-n8n_user}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      # Node options
+      NODE_OPTIONS: "--max-old-space-size=512"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/home/node/workflows:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # PostgreSQL - Metadata, Logs, RBAC, Insights
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      <<: *common-env
+      POSTGRES_DB: ${POSTGRES_DB:-enterprise_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-n8n_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-n8n_user} -d ${POSTGRES_DB:-enterprise_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --------------------------------------------------------------------------
+  # Qdrant Init - Create vector collections on the EXISTING Qdrant instance
+  # --------------------------------------------------------------------------
+  qdrant-init:
+    image: curlimages/curl:latest
+    container_name: qdrant-init
+    entrypoint: ["/bin/sh", "/scripts/init-qdrant.sh"]
+    volumes:
+      - ./scripts/init-qdrant.sh:/scripts/init-qdrant.sh:ro
+    networks:
+      - observability
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # Redis - Query Result Cache
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redis-password-change-me}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis-password-change-me}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # Prometheus Pushgateway - Metrics Ingestion Endpoint
+  # --------------------------------------------------------------------------
+  pushgateway:
+    image: prom/pushgateway:v1.9.0
+    container_name: pushgateway
+    restart: unless-stopped
+    ports:
+      - "9091:9091"
+    command:
+      - "--persistence.file=/data/pushgateway.store"
+      - "--persistence.interval=5m"
+    volumes:
+      - pushgateway_data:/data
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9091/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # Cross-Encoder Reranker Service
+  # --------------------------------------------------------------------------
+  reranker:
+    image: python:3.11-slim
+    container_name: reranker
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *common-env
+      MODEL_NAME: ${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
+      PORT: "8080"
+    volumes:
+      - ./reranker:/app:ro
+      - reranker_cache:/root/.cache
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install --no-cache-dir flask sentence-transformers torch --quiet &&
+        python server.py
+      "
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+# ============================================================================
+# Volumes
+# ============================================================================
+volumes:
+  n8n_data:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  pushgateway_data:
+    driver: local
+  reranker_cache:
+    driver: local
+
+# ============================================================================
+# Networks - Join the existing observability_default network
+# ============================================================================
+networks:
+  observability:
+    external: true
+    name: observability_default

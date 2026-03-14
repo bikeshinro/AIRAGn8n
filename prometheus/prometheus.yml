@@ -1,0 +1,43 @@
+# ============================================================================
+# Prometheus Scrape Config - Enterprise AI (Pushgateway job)
+# ============================================================================
+#
+# HOW TO USE:
+# Your existing Prometheus container is already running. You need to ADD the
+# pushgateway scrape job below to your existing prometheus.yml config.
+#
+# Option A (recommended): Add this job to your current Prometheus config file
+#          and reload via:  curl -X POST http://localhost:9090/-/reload
+#
+# Option B: Mount this file as an additional config and use --config.file
+# ============================================================================
+#
+# Add the following scrape_configs entry to your existing prometheus.yml:
+#
+#   - job_name: "ai_pushgateway"
+#     honor_labels: true
+#     scrape_interval: 10s
+#     static_configs:
+#       - targets: ["pushgateway:9091"]
+#         labels:
+#           service: "ai-pushgateway"
+#           stack: "enterprise-ai"
+#
+# The pushgateway container joins the same observability_default network,
+# so Prometheus can reach it by hostname "pushgateway" on port 9091.
+# ============================================================================
+
+# Standalone config (if you want to test separately):
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "ai_pushgateway"
+    honor_labels: true
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["pushgateway:9091"]
+        labels:
+          service: "ai-pushgateway"
+          stack: "enterprise-ai"

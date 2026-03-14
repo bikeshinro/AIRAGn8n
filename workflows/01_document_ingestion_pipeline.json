@@ -1,0 +1,611 @@
+{
+  "name": "Enterprise AI - Document Ingestion Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ingest-document",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "a1000001-0001-4000-8000-000000000001",
+      "name": "Webhook_Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "webhookId": "ingest-document"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate input and start latency timer\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const body = item.json.body || item.json;\n  const headers = item.json.headers || {};\n  const startTime = Date.now();\n\n  // Validate required fields\n  const requiredFields = ['document_type', 'process_line', 'access_roles'];\n  const missing = requiredFields.filter(f => !body[f]);\n  if (missing.length > 0) {\n    throw new Error(`Missing required fields: ${missing.join(', ')}`);\n  }\n\n  // Validate document_type\n  const validTypes = ['sop', 'fmea', 'rca', 'maintenance'];\n  if (!validTypes.includes(body.document_type)) {\n    throw new Error(`Invalid document_type: ${body.document_type}. Must be one of: ${validTypes.join(', ')}`);\n  }\n\n  // Validate file presence and type\n  const fileName = body.file_name || '';\n  const ext = fileName.split('.').pop().toLowerCase();\n  if (!['pdf', 'docx', 'txt'].includes(ext)) {\n    throw new Error(`Unsupported file type: .${ext}. Accepted: pdf, docx, txt`);\n  }\n\n  // Generate doc_id\n  const makeUuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16); }); const docId = makeUuid();\n\n  results.push({\n    json: {\n      ...body,\n      doc_id: docId,\n      file_extension: ext,\n      file_name: fileName,\n      document_type: body.document_type,\n      process_line: body.process_line,\n      access_roles: Array.isArray(body.access_roles) ? body.access_roles : [body.access_roles],\n      revision_number: body.revision_number || 1,\n      previous_revision_id: body.previous_revision_id || null,\n      ingested_by: body.ingested_by || headers['x-user-id'] || 'system',\n      file_content: body.file_content || '',\n      _metrics: {\n        start_time: startTime,\n        ingestion_id: docId\n      }\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "a1000001-0001-4000-8000-000000000002",
+      "name": "Validate_Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract text content from document based on file type\nconst items = $('Validate_Input').all();\nconst results = [];\n\nfor (const item of items) {\n  const data = item.json;\n  let textContent = '';\n\n  switch (data.file_extension) {\n    case 'txt':\n      // Plain text - use content directly\n      textContent = data.file_content || '';\n      break;\n\n    case 'pdf':\n      // For PDF: content should be base64 encoded or pre-extracted\n      // In production, use a dedicated PDF extraction service\n      if (data.file_content_base64) {\n        // Decode base64 and extract text\n        const buffer = Buffer.from(data.file_content_base64, 'base64');\n        textContent = buffer.toString('utf-8').replace(/[^\\x20-\\x7E\\n\\r\\t]/g, ' ');\n      } else if (data.file_content) {\n        textContent = data.file_content;\n      } else {\n        throw new Error(`PDF content not provided for ${data.file_name}`);\n      }\n      break;\n\n    case 'docx':\n      // For DOCX: content should be pre-extracted or use extraction service\n      if (data.file_content) {\n        textContent = data.file_content;\n      } else {\n        throw new Error(`DOCX content not provided for ${data.file_name}`);\n      }\n      break;\n\n    default:\n      throw new Error(`Unsupported file type: ${data.file_extension}`);\n  }\n\n  // Clean text\n  textContent = textContent\n    .replace(/\\r\\n/g, '\\n')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .replace(/[ \\t]+/g, ' ')\n    .trim();\n\n  if (textContent.length === 0) {\n    throw new Error(`No text content extracted from ${data.file_name}`);\n  }\n\n  results.push({\n    json: {\n      ...data,\n      text_content: textContent,\n      text_length: textContent.length\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "a1000001-0001-4000-8000-000000000003",
+      "name": "Extract_Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split text into chunks with overlap for embedding\nconst items = $input.all();\nconst results = [];\n\nconst CHUNK_SIZE = 1500;\nconst CHUNK_OVERLAP = 200;\nconst MIN_CHUNK_SIZE = 100;\n\nfor (const item of items) {\n  const data = item.json;\n  const text = (data.text_content || '').trim();\n  if (!text) continue;\n\n  const chunks = [];\n  let start = 0;\n\n  while (start < text.length) {\n    let end = Math.min(start + CHUNK_SIZE, text.length);\n\n    if (end < text.length) {\n      const lastPeriod = text.lastIndexOf('.', end);\n      const lastNewline = text.lastIndexOf('\\n', end);\n      const breakPoint = Math.max(lastPeriod, lastNewline);\n      if (breakPoint > start + MIN_CHUNK_SIZE) {\n        end = breakPoint + 1;\n      }\n    }\n\n    const chunkText = text.substring(start, end).trim();\n    if (chunkText.length >= MIN_CHUNK_SIZE) {\n      chunks.push({\n        chunk_index: chunks.length,\n        chunk_text: chunkText,\n        char_count: chunkText.length,\n        token_estimate: Math.ceil(chunkText.length / 4)\n      });\n    }\n\n    const newStart = end - CHUNK_OVERLAP;\n    start = (newStart > start) ? newStart : end;\n    if (start >= text.length) break;\n  }\n\n  for (const chunk of chunks) {\n    results.push({\n      json: {\n        doc_id: data.doc_id,\n        file_name: data.file_name,\n        document_type: data.document_type,\n        process_line: data.process_line,\n        access_roles: data.access_roles,\n        revision_number: data.revision_number,\n        previous_revision_id: data.previous_revision_id,\n        ingested_by: data.ingested_by,\n        vector_index: data.document_type,\n        total_chunks: chunks.length,\n        chunk_index: chunk.chunk_index,\n        chunk_text: chunk.chunk_text,\n        char_count: chunk.char_count,\n        token_estimate: chunk.token_estimate,\n        _metrics: data._metrics,\n        _retry_count: 0\n      }\n    });\n  }\n}\n\nreturn results;"
+      },
+      "id": "a1000001-0001-4000-8000-000000000004",
+      "name": "Split_Into_Chunks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'text-embedding-3-large', input: $json.chunk_text, dimensions: 3072 }) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 20,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "a1000001-0001-4000-8000-000000000005",
+      "name": "Generate_Embeddings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1180,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "OpenAI API Key"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check embedding response and handle retry logic\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const raw = item.json;\n\n  // n8n HTTP node may nest body under .body on some versions\n  const data = (raw.body !== undefined && typeof raw.body === 'object') ? raw.body : raw;\n\n  // Check for API-level error in response body\n  if (data.error) {\n    const apiErr = (typeof data.error === 'object') ? (data.error.message || JSON.stringify(data.error)) : String(data.error);\n    throw new Error(`OpenAI API error: ${apiErr}`);\n  }\n\n  // Extract embedding - handle standard OpenAI shape: { data: [{ embedding: [...] }] }\n  let embedding = null;\n  if (data.data && Array.isArray(data.data) && data.data[0] && Array.isArray(data.data[0].embedding)) {\n    embedding = data.data[0].embedding;\n  } else if (Array.isArray(data) && data[0] && Array.isArray(data[0].embedding)) {\n    embedding = data[0].embedding;\n  }\n\n  // Get paired chunk data from Split_Into_Chunks\n  const prevItem = $('Split_Into_Chunks').item;\n  const prevData = (prevItem && prevItem.json) ? prevItem.json : {};\n  const retryCount = prevData._retry_count || 0;\n\n  if (!embedding || embedding.length === 0) {\n    if (retryCount >= 2) {\n      // Max retries exceeded — skip chunk so rest of document can still complete\n      console.log(`[Embedding] Skipping chunk ${prevData.chunk_index ?? 'unknown'} after ${retryCount} failed attempts. Response: ${JSON.stringify(data).substring(0, 300)}`);\n      continue;\n    }\n    throw new Error(`Embedding generation failed for chunk ${prevData.chunk_index ?? 'unknown'} - retry ${retryCount + 1}`);\n  }\n\n  results.push({\n    json: {\n      ...prevData,\n      vector_uuid: 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16); }),\n      embedding: embedding,\n      embedding_dimensions: embedding.length,\n      embedding_model: 'text-embedding-3-large',\n      _metrics: {\n        ...(prevData._metrics || {}),\n        embedding_time: Date.now()\n      }\n    }\n  });\n}\n\nreturn results;\n"
+      },
+      "id": "a1000001-0001-4000-8000-000000000006",
+      "name": "Process_Embedding_Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ 'http://qdrant:6333/collections/' + $json.vector_index + '/points' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ points: [{ id: $json.vector_uuid, vector: $json.embedding, payload: { doc_id: $json.doc_id, chunk_index: $json.chunk_index, chunk_text: $json.chunk_text, document_type: $json.document_type, process_line: $json.process_line, access_roles: $json.access_roles, revision_number: $json.revision_number, file_name: $json.file_name } }] }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "a1000001-0001-4000-8000-000000000007",
+      "name": "Store_VectorDB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1660,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO document_chunks\n(doc_id, chunk_index, chunk_text, token_count, vector_id, vector_index)\nVALUES ($1, $2, $3, $4, $5, $6)\nRETURNING doc_id, chunk_index, vector_index;",
+        "options": {
+          "queryReplacement": "={{ [ $('Process_Embedding_Response').item.json.doc_id, $('Process_Embedding_Response').item.json.chunk_index, $('Process_Embedding_Response').item.json.chunk_text, $('Process_Embedding_Response').item.json.token_estimate, $('Process_Embedding_Response').item.json.vector_uuid, $('Process_Embedding_Response').item.json.vector_index ] }}"
+        }
+      },
+      "id": "a1000001-0001-4000-8000-000000000008",
+      "name": "Store_Chunk_Metadata",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1900,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate chunk results and prepare document-level metadata insert\nconst items = $input.all();\nconst sourceItems = $('Process_Embedding_Response').all();\n\n// Group by doc_id, pulling metadata from the embedding node (which has full chunk data)\nconst docMap = {};\nfor (let i = 0; i < items.length; i++) {\n  const d = items[i].json;\n  const src = (sourceItems[i] || { json: {} }).json;\n  const docId = d.doc_id || src.doc_id;\n  if (!docId) continue;\n  if (!docMap[docId]) {\n    docMap[docId] = {\n      doc_id: docId,\n      file_name: src.file_name,\n      document_type: src.document_type,\n      process_line: src.process_line,\n      access_roles: src.access_roles,\n      revision_number: src.revision_number,\n      previous_revision_id: src.previous_revision_id,\n      ingested_by: src.ingested_by,\n      vector_index: src.vector_index,\n      chunk_count: 0,\n      _metrics: src._metrics\n    };\n  }\n  docMap[docId].chunk_count++;\n}\n\nconst results = Object.values(docMap).map(doc => ({ json: doc }));\nreturn results;"
+      },
+      "id": "a1000001-0001-4000-8000-000000000009",
+      "name": "Aggregate_Chunks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO document_metadata (doc_id, file_name, document_type, process_line, access_roles, revision_status, revision_number, previous_revision_id, chunk_count, vector_index, ingested_by) VALUES ($1, $2, $3, $4, $5::text[], 'active', $6, (SELECT doc_id FROM document_metadata WHERE doc_id = $7::uuid LIMIT 1), 0, $3, $8) ON CONFLICT (doc_id) DO NOTHING RETURNING doc_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.doc_id, $json.file_name, $json.document_type, $json.process_line, $json.access_roles, $json.revision_number, $json.previous_revision_id || null, $json.ingested_by ] }}"
+        }
+      },
+      "id": "a1000001-0001-4000-8000-000000000010",
+      "name": "Store_Document_Metadata",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2380,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "revision-check",
+              "leftValue": "={{ $json.previous_revision_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isNotEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000001-0001-4000-8000-000000000011",
+      "name": "Has_Previous_Revision",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2620,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE document_metadata SET revision_status = 'superseded', updated_at = NOW() WHERE doc_id = '{{ $json.previous_revision_id }}' AND revision_status = 'active' RETURNING doc_id;",
+        "options": {}
+      },
+      "id": "a1000001-0001-4000-8000-000000000012",
+      "name": "Supersede_Previous_Revision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2860,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute all ingestion metrics for Prometheus\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const data = $('Aggregate_Chunks').item.json || {};\n  const endTime = Date.now();\n  const startTime = (data._metrics && data._metrics.start_time) ? data._metrics.start_time : endTime;\n  const latencySeconds = (endTime - startTime) / 1000;\n  const retryCount = data._retry_count || 0;\n  const superseded = data.previous_revision_id ? 1 : 0;\n  const docType = data.document_type || 'unknown';\n  const procLine = data.process_line || 'unknown';\n  const chunkCount = data.chunk_count || 0;\n\n  const metrics = [\n    `# HELP ai_ingestion_total Total document ingestions`,\n    `# TYPE ai_ingestion_total counter`,\n    `ai_ingestion_total{document_type=\"${docType}\",process_line=\"${procLine}\",status=\"success\"} 1`,\n    ``,\n    `# HELP ai_ingestion_latency_seconds Ingestion latency in seconds`,\n    `# TYPE ai_ingestion_latency_seconds histogram`,\n    `ai_ingestion_latency_seconds{document_type=\"${docType}\",process_line=\"${procLine}\",le=\"1\"} ${latencySeconds <= 1 ? 1 : 0}`,\n    `ai_ingestion_latency_seconds{document_type=\"${docType}\",process_line=\"${procLine}\",le=\"5\"} ${latencySeconds <= 5 ? 1 : 0}`,\n    `ai_ingestion_latency_seconds{document_type=\"${docType}\",process_line=\"${procLine}\",le=\"10\"} ${latencySeconds <= 10 ? 1 : 0}`,\n    `ai_ingestion_latency_seconds{document_type=\"${docType}\",process_line=\"${procLine}\",le=\"30\"} ${latencySeconds <= 30 ? 1 : 0}`,\n    `ai_ingestion_latency_seconds{document_type=\"${docType}\",process_line=\"${procLine}\",le=\"60\"} ${latencySeconds <= 60 ? 1 : 0}`,\n    `ai_ingestion_latency_seconds{document_type=\"${docType}\",process_line=\"${procLine}\",le=\"+Inf\"} 1`,\n    `ai_ingestion_latency_seconds_sum{document_type=\"${docType}\",process_line=\"${procLine}\"} ${latencySeconds}`,\n    `ai_ingestion_latency_seconds_count{document_type=\"${docType}\",process_line=\"${procLine}\"} 1`,\n    ``,\n    `# HELP ai_ingestion_chunks_total Total chunks created`,\n    `# TYPE ai_ingestion_chunks_total counter`,\n    `ai_ingestion_chunks_total{document_type=\"${docType}\",process_line=\"${procLine}\"} ${chunkCount}`,\n    ``,\n    `# HELP ai_ingestion_retry_total Total embedding retries`,\n    `# TYPE ai_ingestion_retry_total counter`,\n    `ai_ingestion_retry_total{document_type=\"${docType}\",stage=\"embedding\"} ${retryCount}`,\n    ``,\n    `# HELP ai_revision_superseded_total Documents marked superseded`,\n    `# TYPE ai_revision_superseded_total counter`,\n    `ai_revision_superseded_total{document_type=\"${docType}\"} ${superseded}`,\n    ``\n  ].join('\\n');\n\n  results.push({\n    json: {\n      ...data,\n      _prometheus_metrics: metrics,\n      _latency_seconds: latencySeconds\n    }\n  });\n}\n\nreturn results;\n"
+      },
+      "id": "a1000001-0001-4000-8000-000000000013",
+      "name": "Compute_Ingestion_Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pushgateway:9091/metrics/job/ai_ingestion/instance/n8n",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json._prometheus_metrics }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "a1000001-0001-4000-8000-000000000014",
+      "name": "Push_Ingestion_Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3340,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, doc_id: $('Aggregate_Chunks').item.json.doc_id, file_name: $('Aggregate_Chunks').item.json.file_name, document_type: $('Aggregate_Chunks').item.json.document_type, chunk_count: $('Aggregate_Chunks').item.json.chunk_count, revision_number: $('Aggregate_Chunks').item.json.revision_number, latency_seconds: $('Compute_Ingestion_Metrics').item.json._latency_seconds }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a1000001-0001-4000-8000-000000000015",
+      "name": "Respond_Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3580,
+        300
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "a1000001-0001-4000-8000-000000000016",
+      "name": "Error_Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle errors with exponential backoff tracking and metric emission\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const error = item.json;\n  const errorMessage = error.message || error.error?.message || 'Unknown ingestion error';\n  const nodeName = error.node?.name || error.workflow?.lastNodeExecuted || 'unknown';\n  const executionId = error.execution?.id || 'unknown';\n\n  // Determine failure stage\n  let stage = 'unknown';\n  if (nodeName.includes('Embedding')) stage = 'embedding';\n  else if (nodeName.includes('Vector')) stage = 'vectordb';\n  else if (nodeName.includes('Postgres') || nodeName.includes('Metadata')) stage = 'database';\n  else if (nodeName.includes('Extract')) stage = 'extraction';\n  else if (nodeName.includes('Validate')) stage = 'validation';\n\n  // Build failure metrics\n  const failureMetrics = [\n    `# HELP ai_ingestion_failed_total Total failed ingestions`,\n    `# TYPE ai_ingestion_failed_total counter`,\n    `ai_ingestion_failed_total{stage=\"${stage}\",error_type=\"${errorMessage.substring(0, 50).replace(/\"/g, '')}\"} 1`,\n    ``,\n    `# HELP ai_ingestion_retry_total Total retries during ingestion`,\n    `# TYPE ai_ingestion_retry_total counter`,\n    `ai_ingestion_retry_total{stage=\"${stage}\"} 1`,\n    ``\n  ].join('\\n');\n\n  results.push({\n    json: {\n      error_message: errorMessage,\n      error_stage: stage,\n      error_node: nodeName,\n      execution_id: executionId,\n      timestamp: new Date().toISOString(),\n      _prometheus_metrics: failureMetrics\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "a1000001-0001-4000-8000-000000000017",
+      "name": "Error_Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pushgateway:9091/metrics/job/ai_ingestion_errors/instance/n8n",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json._prometheus_metrics }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "a1000001-0001-4000-8000-000000000018",
+      "name": "Push_Error_Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO security_audit_log (event_type, user_id, details) VALUES ('ingestion_failure', 'system', '{{ JSON.stringify({ error: $json.error_message, stage: $json.error_stage, node: $json.error_node, execution_id: $json.execution_id }) }}'::jsonb);",
+        "options": {}
+      },
+      "id": "a1000001-0001-4000-8000-000000000019",
+      "name": "Log_Error_To_DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        940,
+        640
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge results from revision supersede branch and no-revision branch\nconst items = $input.all();\nif (items.length === 0) {\n  return $('Aggregate_Chunks').all();\n}\nreturn items;"
+      },
+      "id": "a1000001-0001-4000-8000-000000000020",
+      "name": "Merge_Revision_Paths",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        400
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook_Ingest": {
+      "main": [
+        [
+          {
+            "node": "Validate_Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate_Input": {
+      "main": [
+        [
+          {
+            "node": "Store_Document_Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract_Text": {
+      "main": [
+        [
+          {
+            "node": "Split_Into_Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split_Into_Chunks": {
+      "main": [
+        [
+          {
+            "node": "Generate_Embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate_Embeddings": {
+      "main": [
+        [
+          {
+            "node": "Process_Embedding_Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process_Embedding_Response": {
+      "main": [
+        [
+          {
+            "node": "Store_VectorDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store_VectorDB": {
+      "main": [
+        [
+          {
+            "node": "Store_Chunk_Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store_Chunk_Metadata": {
+      "main": [
+        [
+          {
+            "node": "Aggregate_Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate_Chunks": {
+      "main": [
+        [
+          {
+            "node": "Has_Previous_Revision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store_Document_Metadata": {
+      "main": [
+        [
+          {
+            "node": "Extract_Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has_Previous_Revision": {
+      "main": [
+        [
+          {
+            "node": "Supersede_Previous_Revision",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge_Revision_Paths",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supersede_Previous_Revision": {
+      "main": [
+        [
+          {
+            "node": "Merge_Revision_Paths",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge_Revision_Paths": {
+      "main": [
+        [
+          {
+            "node": "Compute_Ingestion_Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute_Ingestion_Metrics": {
+      "main": [
+        [
+          {
+            "node": "Push_Ingestion_Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push_Ingestion_Metrics": {
+      "main": [
+        [
+          {
+            "node": "Respond_Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error_Trigger": {
+      "main": [
+        [
+          {
+            "node": "Error_Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error_Handler": {
+      "main": [
+        [
+          {
+            "node": "Push_Error_Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push_Error_Metrics": {
+      "main": [
+        [
+          {
+            "node": "Log_Error_To_DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "enterprise-ai"
+    },
+    {
+      "name": "ingestion"
+    },
+    {
+      "name": "production"
+    }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "ingestion-v1.0.0"
+}

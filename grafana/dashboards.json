@@ -1,0 +1,269 @@
+{
+  "annotations": { "list": [] },
+  "description": "Enterprise AI Inspection Knowledge Assistant - Unified Monitoring",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Executive Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Total Queries (24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [{ "expr": "sum(increase(ai_query_total[24h]))", "legendFormat": "Queries" }],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 500 }, { "color": "red", "value": 2000 }] } } }
+    },
+    {
+      "title": "Total Ingestions (24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "targets": [{ "expr": "sum(increase(ai_ingestion_total[24h]))", "legendFormat": "Ingestions" }],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "green", "value": null }] } } }
+    },
+    {
+      "title": "Avg Confidence Score",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "targets": [{ "expr": "avg(ai_confidence_score)", "legendFormat": "Confidence" }],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.4 }, { "color": "green", "value": 0.7 }] } } }
+    },
+    {
+      "title": "Hallucination Rate",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "targets": [{ "expr": "sum(increase(ai_hallucination_flag_total[24h])) / sum(increase(ai_query_total[24h])) * 100", "legendFormat": "%" }],
+      "fieldConfig": { "defaults": { "unit": "percent", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 15 }] } } }
+    },
+    {
+      "title": "Active Documents",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "targets": [{ "expr": "sum(ai_active_documents_total{revision_status=\"active\"})", "legendFormat": "Active" }]
+    },
+    {
+      "title": "Security Events (24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "targets": [{ "expr": "sum(increase(ai_security_events_total[24h]))", "legendFormat": "Events" }],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 20 }] } } }
+    },
+    {
+      "title": "Engineering / Performance",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Query Latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(ai_query_latency_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(ai_query_latency_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(ai_query_latency_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Latency Breakdown",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, rate(ai_embedding_latency_seconds_bucket[5m]))", "legendFormat": "Embedding p95" },
+        { "expr": "histogram_quantile(0.95, rate(ai_vector_query_latency_seconds_bucket[5m]))", "legendFormat": "Vector Search p95" },
+        { "expr": "histogram_quantile(0.95, rate(ai_rerank_latency_seconds_bucket[5m]))", "legendFormat": "Rerank p95" },
+        { "expr": "histogram_quantile(0.95, rate(ai_answer_generation_latency_seconds_bucket[5m]))", "legendFormat": "LLM Generation p95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Ingestion Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(ai_ingestion_latency_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(ai_ingestion_latency_seconds_bucket[5m]))", "legendFormat": "p95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Retry Rates",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        { "expr": "rate(ai_ingestion_retry_total[5m])", "legendFormat": "Ingestion Retries {{stage}}" },
+        { "expr": "rate(ai_monitoring_retry_total[5m])", "legendFormat": "Monitoring Retries" }
+      ]
+    },
+    {
+      "title": "AI Quality",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Confidence Score Distribution",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "targets": [{ "expr": "ai_confidence_score", "legendFormat": "{{query_id}}" }],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1 } }
+    },
+    {
+      "title": "Hallucination Flags Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "targets": [
+        { "expr": "increase(ai_hallucination_flag_total[1h])", "legendFormat": "Hallucinations {{process_line}}" },
+        { "expr": "increase(ai_unsupported_answers_total[1h])", "legendFormat": "Unsupported {{process_line}}" }
+      ]
+    },
+    {
+      "title": "Low Confidence Queries (Training Opportunities)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 31 },
+      "targets": [{ "expr": "topk(20, ai_confidence_score < 0.4)", "format": "table" }]
+    },
+    {
+      "title": "Security / Compliance",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "RBAC Rejections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "targets": [{ "expr": "increase(ai_rbac_rejections_total[1h])", "legendFormat": "{{reason}}" }]
+    },
+    {
+      "title": "Prompt Injection Attempts",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "targets": [{ "expr": "increase(ai_prompt_injection_attempts_total[1h])", "legendFormat": "Injections" }]
+    },
+    {
+      "title": "Cross-Process Access Attempts",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "targets": [{ "expr": "increase(ai_cross_process_access_attempts_total[1h])", "legendFormat": "Cross-Process" }]
+    },
+    {
+      "title": "Security Events by Type",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "targets": [{ "expr": "ai_security_events_total", "legendFormat": "{{event_type}}" }]
+    },
+    {
+      "title": "Auth Failures",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "targets": [{ "expr": "increase(ai_auth_failures_total[1h])", "legendFormat": "{{reason}}" }]
+    },
+    {
+      "title": "Plant / Process Insights",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Queries by Process Line & Shift",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
+      "targets": [{ "expr": "ai_queries_by_process_line", "legendFormat": "{{process_line}} ({{shift}})" }]
+    },
+    {
+      "title": "Avg Confidence by Process Line",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
+      "targets": [{ "expr": "ai_avg_confidence_by_process_line", "legendFormat": "{{process_line}}" }],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.4 }, { "color": "green", "value": 0.7 }] } } }
+    },
+    {
+      "title": "Cost by Index",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 65 },
+      "targets": [{ "expr": "ai_cost_per_index", "legendFormat": "{{indexes}}" }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "title": "Avg Latency by Process Line",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 65 },
+      "targets": [{ "expr": "ai_avg_latency_by_process_line", "legendFormat": "{{process_line}}" }],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "title": "Revision Control",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 73 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Active vs Superseded Documents",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 74 },
+      "targets": [{ "expr": "ai_active_documents_total", "legendFormat": "{{document_type}} ({{revision_status}})" }]
+    },
+    {
+      "title": "Superseded Revisions Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 74 },
+      "targets": [
+        { "expr": "increase(ai_revision_superseded_total[1h])", "legendFormat": "Superseded {{document_type}}" },
+        { "expr": "increase(ai_retrieval_from_superseded_total[1h])", "legendFormat": "Superseded Retrieval Blocked" }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["enterprise-ai", "inspection", "rag"],
+  "templating": {
+    "list": [
+      {
+        "name": "process_line",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(ai_query_total, process_line)",
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "document_type",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(ai_active_documents_total, document_type)",
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "shift",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(ai_queries_by_process_line, shift)",
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Enterprise AI Inspection Knowledge Assistant",
+  "uid": "enterprise-ai-inspection",
+  "version": 1
+}

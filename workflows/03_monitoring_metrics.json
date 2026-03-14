@@ -1,0 +1,399 @@
+{
+  "name": "Enterprise AI - Monitoring & Metrics",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "minutes", "minutesInterval": 5 }
+          ]
+        }
+      },
+      "id": "c3000001-0001-4000-8000-000000000001",
+      "name": "Schedule_5min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT revision_status, document_type, COUNT(*) as doc_count FROM document_metadata GROUP BY revision_status, document_type;",
+        "options": {}
+      },
+      "id": "c3000001-0001-4000-8000-000000000002",
+      "name": "Query_Active_Documents",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [500, 160],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT document_type, COUNT(*) FILTER (WHERE revision_status = 'superseded') as superseded_count, COUNT(*) FILTER (WHERE revision_status = 'active') as active_count, COUNT(*) as total_count FROM document_metadata GROUP BY document_type;",
+        "options": {}
+      },
+      "id": "c3000001-0001-4000-8000-000000000003",
+      "name": "Query_Revision_Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [500, 340],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT process_line, shift, COUNT(*) as query_count, AVG(confidence_score) as avg_confidence, COUNT(*) FILTER (WHERE hallucination_flag = true) as hallucination_count, COUNT(*) FILTER (WHERE confidence_score < 0.4) as low_confidence_count, SUM(cost_estimate) as total_cost, AVG(total_latency_ms) as avg_latency_ms FROM retrieval_logs WHERE created_at > NOW() - INTERVAL '5 minutes' GROUP BY process_line, shift;",
+        "options": {}
+      },
+      "id": "c3000001-0001-4000-8000-000000000004",
+      "name": "Query_Plant_Insights",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [500, 520],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT query_text, confidence_score, process_line, user_role, created_at FROM retrieval_logs WHERE confidence_score < 0.4 AND created_at > NOW() - INTERVAL '1 hour' ORDER BY confidence_score ASC LIMIT 20;",
+        "options": {}
+      },
+      "id": "c3000001-0001-4000-8000-000000000005",
+      "name": "Query_Low_Confidence",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [500, 700],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT event_type, COUNT(*) as event_count FROM security_audit_log WHERE created_at > NOW() - INTERVAL '5 minutes' GROUP BY event_type;",
+        "options": {}
+      },
+      "id": "c3000001-0001-4000-8000-000000000006",
+      "name": "Query_Security_Events",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [500, 880],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT rl.matched_indexes, COUNT(*) as query_count, SUM(rl.cost_estimate) as total_cost FROM retrieval_logs rl WHERE rl.created_at > NOW() - INTERVAL '5 minutes' GROUP BY rl.matched_indexes;",
+        "options": {}
+      },
+      "id": "c3000001-0001-4000-8000-000000000007",
+      "name": "Query_Cost_Per_Index",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [500, 1060],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all monitoring data into Prometheus metrics\nconst activeDocsData = $('Query_Active_Documents').all();\nconst revisionData = $('Query_Revision_Stats').all();\nconst plantData = $('Query_Plant_Insights').all();\nconst lowConfData = $('Query_Low_Confidence').all();\nconst securityData = $('Query_Security_Events').all();\nconst costData = $('Query_Cost_Per_Index').all();\n\nconst lines = [];\n\n// === Active Documents Gauge ===\nlines.push('# HELP ai_active_documents_total Number of active documents by type and status');\nlines.push('# TYPE ai_active_documents_total gauge');\nfor (const row of activeDocsData) {\n  const d = row.json;\n  lines.push(`ai_active_documents_total{document_type=\"${d.document_type || 'unknown'}\",revision_status=\"${d.revision_status || 'unknown'}\"} ${d.doc_count || 0}`);\n}\nlines.push('');\n\n// === Revision Stats ===\nlines.push('# HELP ai_revision_superseded_total Total superseded documents by type');\nlines.push('# TYPE ai_revision_superseded_total gauge');\nfor (const row of revisionData) {\n  const d = row.json;\n  lines.push(`ai_revision_superseded_total{document_type=\"${d.document_type || 'unknown'}\"} ${d.superseded_count || 0}`);\n}\nlines.push('');\n\n// === Plant / Process Insights ===\nlines.push('# HELP ai_queries_by_process_line Queries per process line and shift (5min window)');\nlines.push('# TYPE ai_queries_by_process_line gauge');\nlines.push('# HELP ai_avg_confidence_by_process_line Average confidence by process line');\nlines.push('# TYPE ai_avg_confidence_by_process_line gauge');\nlines.push('# HELP ai_hallucinations_by_process_line Hallucination count by process line');\nlines.push('# TYPE ai_hallucinations_by_process_line gauge');\nlines.push('# HELP ai_low_confidence_by_process_line Low confidence query count by process line');\nlines.push('# TYPE ai_low_confidence_by_process_line gauge');\nlines.push('# HELP ai_cost_by_process_line Cost by process line (5min window)');\nlines.push('# TYPE ai_cost_by_process_line gauge');\nlines.push('# HELP ai_avg_latency_by_process_line Average latency ms by process line');\nlines.push('# TYPE ai_avg_latency_by_process_line gauge');\nfor (const row of plantData) {\n  const d = row.json;\n  const pl = d.process_line || 'unknown';\n  const shift = d.shift || 'unknown';\n  const labels = `process_line=\"${pl}\",shift=\"${shift}\"`;\n  lines.push(`ai_queries_by_process_line{${labels}} ${d.query_count || 0}`);\n  lines.push(`ai_avg_confidence_by_process_line{${labels}} ${d.avg_confidence || 0}`);\n  lines.push(`ai_hallucinations_by_process_line{${labels}} ${d.hallucination_count || 0}`);\n  lines.push(`ai_low_confidence_by_process_line{${labels}} ${d.low_confidence_count || 0}`);\n  lines.push(`ai_cost_by_process_line{${labels}} ${d.total_cost || 0}`);\n  lines.push(`ai_avg_latency_by_process_line{${labels}} ${d.avg_latency_ms || 0}`);\n}\nlines.push('');\n\n// === Low Confidence Training Insights ===\nlines.push('# HELP ai_low_confidence_queries_total Count of low-confidence queries in last hour');\nlines.push('# TYPE ai_low_confidence_queries_total gauge');\nlines.push(`ai_low_confidence_queries_total{} ${lowConfData.length}`);\nlines.push('');\n\n// === Security Events ===\nlines.push('# HELP ai_security_events_total Security events in 5min window');\nlines.push('# TYPE ai_security_events_total gauge');\nfor (const row of securityData) {\n  const d = row.json;\n  lines.push(`ai_security_events_total{event_type=\"${d.event_type || 'unknown'}\"} ${d.event_count || 0}`);\n}\nlines.push('');\n\n// === Cost Per Index ===\nlines.push('# HELP ai_cost_per_index Total cost by index (5min window)');\nlines.push('# TYPE ai_cost_per_index gauge');\nfor (const row of costData) {\n  const d = row.json;\n  const indexes = Array.isArray(d.matched_indexes) ? d.matched_indexes.join(',') : String(d.matched_indexes || 'unknown');\n  lines.push(`ai_cost_per_index{indexes=\"${indexes}\"} ${d.total_cost || 0}`);\n}\nlines.push('');\n\nconst metricsBody = lines.join('\\n');\n\nreturn [{\n  json: {\n    _prometheus_metrics: metricsBody,\n    _summary: {\n      total_active_docs: activeDocsData.reduce((s, r) => s + (r.json.doc_count || 0), 0),\n      total_plant_queries: plantData.reduce((s, r) => s + (r.json.query_count || 0), 0),\n      low_confidence_count: lowConfData.length,\n      security_events: securityData.reduce((s, r) => s + (r.json.event_count || 0), 0)\n    },\n    _low_confidence_queries: lowConfData.map(r => r.json),\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "c3000001-0001-4000-8000-000000000008",
+      "name": "Build_Monitoring_Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 520]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pushgateway:9091/metrics/job/ai_monitoring/instance/n8n",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json._prometheus_metrics }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "c3000001-0001-4000-8000-000000000009",
+      "name": "Push_Monitoring_Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 520],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO query_insights (process_line, shift, query_count, avg_confidence, low_confidence_queries, cost_per_index, period_start, period_end) SELECT process_line, shift, COUNT(*), AVG(confidence_score), jsonb_agg(CASE WHEN confidence_score < 0.4 THEN jsonb_build_object('query', query_text, 'confidence', confidence_score, 'user_role', user_role) ELSE NULL END) FILTER (WHERE confidence_score < 0.4), jsonb_object_agg(COALESCE(matched_indexes[1], 'unknown'), cost_estimate) FILTER (WHERE cost_estimate IS NOT NULL), NOW() - INTERVAL '5 minutes', NOW() FROM retrieval_logs WHERE created_at > NOW() - INTERVAL '5 minutes' GROUP BY process_line, shift;",
+        "options": {}
+      },
+      "id": "c3000001-0001-4000-8000-000000000010",
+      "name": "Store_Period_Insights",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1400, 520],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log monitoring run completion\nconst data = $input.first().json;\nconsole.log(`[Monitoring] Cycle completed at ${data.timestamp}`);\nconsole.log(`[Monitoring] Summary: ${JSON.stringify(data._summary)}`);\nreturn $input.all();"
+      },
+      "id": "c3000001-0001-4000-8000-000000000011",
+      "name": "Log_Monitoring_Complete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, 520]
+    },
+    {
+      "parameters": {},
+      "id": "c3000001-0001-4000-8000-000000000012",
+      "name": "Error_Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [220, 900]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle monitoring errors with retry metric emission\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const error = item.json;\n  const errorMsg = error.message || error.error?.message || 'Unknown monitoring error';\n  const nodeName = error.node?.name || 'unknown';\n\n  const metrics = [\n    '# HELP ai_monitoring_errors_total Monitoring pipeline errors',\n    '# TYPE ai_monitoring_errors_total counter',\n    `ai_monitoring_errors_total{node=\"${nodeName}\",error=\"${errorMsg.substring(0, 60).replace(/\"/g, '')}\"} 1`,\n    '',\n    '# HELP ai_monitoring_retry_total Monitoring retries',\n    '# TYPE ai_monitoring_retry_total counter',\n    `ai_monitoring_retry_total{node=\"${nodeName}\"} 1`,\n    ''\n  ].join('\\n');\n\n  results.push({\n    json: {\n      error_message: errorMsg,\n      error_node: nodeName,\n      timestamp: new Date().toISOString(),\n      _prometheus_metrics: metrics\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "c3000001-0001-4000-8000-000000000013",
+      "name": "Monitoring_Error_Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 900]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pushgateway:9091/metrics/job/ai_monitoring_errors/instance/n8n",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json._prometheus_metrics }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "c3000001-0001-4000-8000-000000000014",
+      "name": "Push_Monitoring_Error_Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [780, 900]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "hours", "hoursInterval": 1 }
+          ]
+        }
+      },
+      "id": "c3000001-0001-4000-8000-000000000015",
+      "name": "Schedule_Hourly_Cleanup",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 1200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "DELETE FROM security_audit_log WHERE created_at < NOW() - INTERVAL '90 days'; DELETE FROM retrieval_logs WHERE created_at < NOW() - INTERVAL '90 days'; DELETE FROM query_insights WHERE created_at < NOW() - INTERVAL '365 days';",
+        "options": {}
+      },
+      "id": "c3000001-0001-4000-8000-000000000016",
+      "name": "Cleanup_Old_Records",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [500, 1200],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Emit cleanup metrics\nconst items = $input.all();\nconst metrics = [\n  '# HELP ai_cleanup_runs_total Data cleanup runs',\n  '# TYPE ai_cleanup_runs_total counter',\n  `ai_cleanup_runs_total{} 1`,\n  ''\n].join('\\n');\n\nreturn [{ json: { _prometheus_metrics: metrics, timestamp: new Date().toISOString() } }];"
+      },
+      "id": "c3000001-0001-4000-8000-000000000017",
+      "name": "Emit_Cleanup_Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [780, 1200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pushgateway:9091/metrics/job/ai_cleanup/instance/n8n",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json._prometheus_metrics }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "c3000001-0001-4000-8000-000000000018",
+      "name": "Push_Cleanup_Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1060, 1200]
+    }
+  ],
+  "connections": {
+    "Schedule_5min": {
+      "main": [
+        [
+          { "node": "Query_Active_Documents", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Query_Active_Documents": {
+      "main": [
+        [
+          { "node": "Query_Revision_Stats", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Query_Revision_Stats": {
+      "main": [
+        [
+          { "node": "Query_Plant_Insights", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Query_Plant_Insights": {
+      "main": [
+        [
+          { "node": "Query_Low_Confidence", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Query_Low_Confidence": {
+      "main": [
+        [
+          { "node": "Query_Security_Events", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Query_Security_Events": {
+      "main": [
+        [
+          { "node": "Query_Cost_Per_Index", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Query_Cost_Per_Index": {
+      "main": [
+        [
+          { "node": "Build_Monitoring_Metrics", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Build_Monitoring_Metrics": {
+      "main": [
+        [
+          { "node": "Push_Monitoring_Metrics", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Push_Monitoring_Metrics": {
+      "main": [
+        [
+          { "node": "Store_Period_Insights", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Store_Period_Insights": {
+      "main": [
+        [
+          { "node": "Log_Monitoring_Complete", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Error_Trigger": {
+      "main": [
+        [
+          { "node": "Monitoring_Error_Handler", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Monitoring_Error_Handler": {
+      "main": [
+        [
+          { "node": "Push_Monitoring_Error_Metrics", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Schedule_Hourly_Cleanup": {
+      "main": [
+        [
+          { "node": "Cleanup_Old_Records", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Cleanup_Old_Records": {
+      "main": [
+        [
+          { "node": "Emit_Cleanup_Metrics", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Emit_Cleanup_Metrics": {
+      "main": [
+        [
+          { "node": "Push_Cleanup_Metrics", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    { "name": "enterprise-ai" },
+    { "name": "monitoring" },
+    { "name": "production" }
+  ],
+  "triggerCount": 2,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "monitoring-v1.0.0"
+}

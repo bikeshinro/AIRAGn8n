@@ -1,0 +1,822 @@
+{
+  "name": "Enterprise AI - Query Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "query",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b2000001-0001-4000-8000-000000000001",
+      "name": "Webhook_Query",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "webhookId": "ai-query"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Start timer and extract request data\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const body = item.json.body || item.json;\n  const headers = item.json.headers || {};\n  const startTime = Date.now();\n\n  if (!body.query || typeof body.query !== 'string' || body.query.trim().length === 0) {\n    throw new Error('Missing or empty query field');\n  }\n\n  results.push({\n    json: {\n      query: body.query.trim(),\n      process_line: body.process_line || null,\n      shift: body.shift || null,\n      target_indexes: body.target_indexes || ['sop', 'fmea', 'rca', 'maintenance'],\n      top_k: body.top_k || 10,\n      authorization: headers.authorization || headers.Authorization || '',\n      _metrics: {\n        start_time: startTime,\n        query_id: `qry-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`\n      }\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "b2000001-0001-4000-8000-000000000002",
+      "name": "Parse_Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate JWT / OAuth2 token\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const data = item.json;\n  const authHeader = data.authorization;\n\n  if (!authHeader || !authHeader.startsWith('Bearer ')) {\n    throw new Error('UNAUTHORIZED: Missing or invalid Authorization header. Expected: Bearer <token>');\n  }\n\n  const token = authHeader.replace('Bearer ', '');\n\n  // Decode JWT payload (base64url)\n  // In production, verify signature with public key / JWKS endpoint\n  try {\n    const parts = token.split('.');\n    if (parts.length !== 3) {\n      throw new Error('Invalid JWT format');\n    }\n\n    const payloadB64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');\n    const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf-8'));\n\n    // Check expiration\n    const now = Math.floor(Date.now() / 1000);\n    if (payload.exp && payload.exp < now) {\n      throw new Error('JWT token has expired');\n    }\n\n    // Extract user info\n    const userId = payload.sub || payload.user_id || 'unknown';\n    const userRole = payload.role || payload.user_role || 'viewer';\n    const userProcessLines = payload.process_lines || payload.allowed_process_lines || ['*'];\n\n    results.push({\n      json: {\n        ...data,\n        user_id: userId,\n        user_role: userRole,\n        user_process_lines: userProcessLines,\n        jwt_valid: true\n      }\n    });\n  } catch (e) {\n    if (e.message.includes('JWT') || e.message.includes('expired')) {\n      throw e;\n    }\n    throw new Error(`UNAUTHORIZED: Failed to decode JWT - ${e.message}`);\n  }\n}\n\nreturn results;"
+      },
+      "id": "b2000001-0001-4000-8000-000000000003",
+      "name": "Validate_JWT",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Enforce RBAC: check user_role against allowed indexes and process_lines\nconst items = $input.all();\nconst results = [];\n\n// RBAC policy map (loaded from DB in production; inline for workflow portability)\nconst rbacPolicies = {\n  'admin':     { indexes: ['sop','fmea','rca','maintenance'], lines: ['*'], canQuery: true },\n  'engineer':  { indexes: ['sop','fmea','rca','maintenance'], lines: ['*'], canQuery: true },\n  'operator':  { indexes: ['sop','maintenance'],              lines: ['*'], canQuery: true },\n  'inspector': { indexes: ['sop','fmea','rca'],               lines: ['*'], canQuery: true },\n  'viewer':    { indexes: ['sop'],                             lines: ['*'], canQuery: true }\n};\n\nfor (const item of items) {\n  const data = item.json;\n  const policy = rbacPolicies[data.user_role];\n\n  if (!policy || !policy.canQuery) {\n    // Emit RBAC rejection metric flag\n    throw new Error(`RBAC_REJECTION: Role '${data.user_role}' is not authorized to query`);\n  }\n\n  // Filter requested indexes to only allowed ones\n  const allowedIndexes = data.target_indexes.filter(idx => policy.indexes.includes(idx));\n  if (allowedIndexes.length === 0) {\n    throw new Error(`RBAC_REJECTION: Role '${data.user_role}' has no access to requested indexes: ${data.target_indexes.join(', ')}`);\n  }\n\n  // Check process_line access\n  if (data.process_line && !policy.lines.includes('*')) {\n    if (!policy.lines.includes(data.process_line)) {\n      throw new Error(`CROSS_PROCESS_ACCESS: Role '${data.user_role}' cannot access process line '${data.process_line}'`);\n    }\n  }\n\n  results.push({\n    json: {\n      ...data,\n      target_indexes: allowedIndexes,\n      rbac_passed: true,\n      rbac_filtered_indexes: data.target_indexes.length - allowedIndexes.length\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "b2000001-0001-4000-8000-000000000004",
+      "name": "Enforce_RBAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Detect prompt injection attacks\nconst items = $input.all();\nconst results = [];\n\n// Prompt injection patterns\nconst INJECTION_PATTERNS = [\n  /ignore\\s+(all\\s+)?(previous|above|prior)\\s+(instructions|prompts|rules)/i,\n  /disregard\\s+(all\\s+)?(previous|above|prior)/i,\n  /you\\s+are\\s+now\\s+(a|an|the)\\s+/i,\n  /pretend\\s+(you\\s+are|to\\s+be)/i,\n  /act\\s+as\\s+(a|an|if)/i,\n  /system\\s*:\\s*/i,\n  /\\[\\s*INST\\s*\\]/i,\n  /<<\\s*SYS\\s*>>/i,\n  /forget\\s+(everything|all|your)/i,\n  /override\\s+(your|the|all)\\s+(instructions|rules|guidelines)/i,\n  /new\\s+instructions?\\s*:/i,\n  /reveal\\s+(your|the)\\s+(system|initial|original)\\s+(prompt|instructions)/i,\n  /what\\s+(are|is)\\s+your\\s+(system|initial)\\s+(prompt|instructions)/i,\n  /output\\s+(your|the)\\s+(system|initial)\\s+prompt/i,\n  /jailbreak/i,\n  /DAN\\s+mode/i,\n  /developer\\s+mode/i\n];\n\nfor (const item of items) {\n  const data = item.json;\n  const query = data.query;\n  let injectionDetected = false;\n  let matchedPattern = null;\n\n  for (const pattern of INJECTION_PATTERNS) {\n    if (pattern.test(query)) {\n      injectionDetected = true;\n      matchedPattern = pattern.toString();\n      break;\n    }\n  }\n\n  // Additional heuristic: very long queries or queries with special formatting\n  if (!injectionDetected && query.length > 2000) {\n    injectionDetected = true;\n    matchedPattern = 'query_length_exceeded';\n  }\n\n  if (injectionDetected) {\n    throw new Error(`PROMPT_INJECTION: Potential prompt injection detected. Pattern: ${matchedPattern}`);\n  }\n\n  results.push({\n    json: {\n      ...data,\n      injection_check_passed: true\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "b2000001-0001-4000-8000-000000000005",
+      "name": "Detect_Prompt_Injection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'http://redis:6379' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ command: 'GET', args: ['ai_cache:' + Buffer.from($json.query).toString('base64').substring(0, 64)] }) }}",
+        "options": {
+          "timeout": 2000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000006",
+      "name": "Check_Redis_Cache",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1420,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Determine if cache hit or miss\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const data = item.json;\n  const prevData = $('Detect_Prompt_Injection').item.json;\n  const cacheResult = data.result || data.value || null;\n\n  let cacheHit = false;\n  let cachedAnswer = null;\n\n  if (cacheResult && cacheResult !== 'null' && cacheResult !== '') {\n    try {\n      cachedAnswer = JSON.parse(cacheResult);\n      if (cachedAnswer && cachedAnswer.answer) {\n        cacheHit = true;\n      }\n    } catch (e) {\n      cacheHit = false;\n    }\n  }\n\n  results.push({\n    json: {\n      ...prevData,\n      cache_hit: cacheHit,\n      cached_answer: cachedAnswer,\n      _metrics: {\n        ...prevData._metrics,\n        cache_check_time: Date.now()\n      }\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "b2000001-0001-4000-8000-000000000007",
+      "name": "Evaluate_Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cache-check",
+              "leftValue": "={{ $json.cache_hit }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2000001-0001-4000-8000-000000000008",
+      "name": "Cache_Hit_Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Return cached answer directly with cache-hit metrics\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const data = item.json;\n  const endTime = Date.now();\n  const latency = (endTime - data._metrics.start_time) / 1000;\n\n  const metrics = [\n    `# HELP ai_query_total Total queries processed`,\n    `# TYPE ai_query_total counter`,\n    `ai_query_total{cache=\"hit\",process_line=\"${data.process_line || 'all'}\"} 1`,\n    ``,\n    `# HELP ai_query_latency_seconds Query latency`,\n    `# TYPE ai_query_latency_seconds histogram`,\n    `ai_query_latency_seconds_sum{cache=\"hit\"} ${latency}`,\n    `ai_query_latency_seconds_count{cache=\"hit\"} 1`,\n    ``\n  ].join('\\n');\n\n  results.push({\n    json: {\n      answer: data.cached_answer.answer,\n      confidence_score: data.cached_answer.confidence_score,\n      sources: data.cached_answer.sources || [],\n      cache_hit: true,\n      latency_seconds: latency,\n      _prometheus_metrics: metrics,\n      _metrics: data._metrics\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "b2000001-0001-4000-8000-000000000009",
+      "name": "Return_Cached_Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'text-embedding-3-large', input: $json.query, dimensions: 3072 }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000010",
+      "name": "Generate_Query_Embedding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2140,
+        440
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "OpenAI API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse embedding response and prepare multi-index search\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const embeddingResp = item.json;\n  const prevData = $('Cache_Hit_Check').item.json;\n\n  let embedding = null;\n  if (embeddingResp.data && embeddingResp.data[0]) {\n    embedding = embeddingResp.data[0].embedding;\n  }\n\n  if (!embedding) {\n    throw new Error('Failed to generate query embedding');\n  }\n\n  const embeddingTime = Date.now();\n\n  // Create one search request per target index\n  for (const indexName of prevData.target_indexes) {\n    results.push({\n      json: {\n        ...prevData,\n        query_embedding: embedding,\n        current_index: indexName,\n        _metrics: {\n          ...prevData._metrics,\n          embedding_time: embeddingTime,\n          embedding_latency_ms: embeddingTime - prevData._metrics.start_time\n        }\n      }\n    });\n  }\n}\n\nreturn results;"
+      },
+      "id": "b2000001-0001-4000-8000-000000000011",
+      "name": "Prepare_Multi_Index_Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2380,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'http://qdrant:6333/collections/' + $json.current_index + '/points/search' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ vector: $json.query_embedding, limit: $json.top_k, with_payload: true, filter: { must: $json.process_line ? [{ key: 'process_line', match: { value: $json.process_line } }] : [] } }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000012",
+      "name": "Vector_Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2620,
+        440
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge multi-index results and filter superseded revisions\nconst items = $input.all();\nconst sourceItems = $('Prepare_Multi_Index_Search').all();\nconst allResults = [];\nlet queryData = null;\n\nfor (let i = 0; i < items.length; i++) {\n  const data = items[i].json;\n  const src = (sourceItems[i] || sourceItems[0] || { json: {} }).json;\n  if (!queryData) queryData = src;\n\n  const results = data.result || data.points || [];\n  for (const r of results) {\n    allResults.push({\n      id: r.id,\n      score: r.score,\n      payload: r.payload || {},\n      index: src.current_index || 'unknown'\n    });\n  }\n}\n\nconst vectorSearchTime = Date.now();\n\n// Filter out superseded revisions\n// Group by doc_id, keep only highest revision_number\nconst docRevisions = {};\nfor (const r of allResults) {\n  const docId = r.payload.doc_id || r.id;\n  const revNum = r.payload.revision_number || 1;\n  if (!docRevisions[docId] || docRevisions[docId].revision_number < revNum) {\n    docRevisions[docId] = { ...r, revision_number: revNum };\n  }\n}\n\nconst filteredResults = Object.values(docRevisions);\nconst supersededCount = allResults.length - filteredResults.length;\n\n// Sort by score descending\nfilteredResults.sort((a, b) => b.score - a.score);\n\n// Take top_k\nconst topK = filteredResults.slice(0, (queryData && queryData.top_k) || 10);\n\nconst metrics = (queryData && queryData._metrics) ? queryData._metrics : {};\nreturn [{\n  json: {\n    ...queryData,\n    search_results: topK,\n    total_results: allResults.length,\n    filtered_results: topK.length,\n    superseded_filtered: supersededCount,\n    matched_indexes: [...new Set(topK.map(r => r.index))],\n    matched_doc_ids: topK.map(r => r.payload.doc_id || r.id),\n    top_k_scores: topK.map(r => r.score),\n    _metrics: {\n      ...metrics,\n      vector_search_time: vectorSearchTime,\n      vector_query_latency_ms: vectorSearchTime - (metrics.embedding_time || metrics.start_time || vectorSearchTime)\n    }\n  }\n}];"
+      },
+      "id": "b2000001-0001-4000-8000-000000000013",
+      "name": "Merge_Filter_Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://reranker:8080/rerank",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.query, passages: $json.search_results.map(r => r.payload.chunk_text || ''), top_k: Math.min($json.top_k, 5) }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000014",
+      "name": "Cross_Encoder_Rerank",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3100,
+        440
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process reranking results and build LLM context\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const reranked = item.json;\n  const prevItem = $('Merge_Filter_Results').item;\n  const prevData = (prevItem && prevItem.json) ? prevItem.json : {};\n  const rerankTime = Date.now();\n\n  const searchResults = prevData.search_results || [];\n  const topKScores = prevData.top_k_scores || [];\n\n  let finalResults = searchResults;\n  let rerankScores = topKScores;\n\n  if (reranked.results && Array.isArray(reranked.results) && reranked.results.length > 0) {\n    const sorted = reranked.results.slice().sort((a, b) => b.score - a.score).slice(0, 5);\n    finalResults = sorted.map(r => searchResults[r.index]).filter(r => r != null);\n    rerankScores = sorted.map(r => r.score);\n  } else {\n    finalResults = searchResults.slice(0, 5);\n    rerankScores = topKScores.slice(0, 5);\n  }\n\n  const contextParts = finalResults.map((r, i) => {\n    const payload = (r && r.payload) ? r.payload : {};\n    return `[Source ${i + 1} | Index: ${r ? r.index : 'N/A'} | Doc: ${payload.file_name || 'N/A'} | Line: ${payload.process_line || 'N/A'}]\\n${payload.chunk_text || ''}`;\n  });\n  const context = contextParts.join('\\n\\n---\\n\\n');\n\n  const systemPrompt = `You are an Enterprise AI Inspection Knowledge Assistant. Your role is to answer questions about standard operating procedures (SOPs), failure mode and effects analysis (FMEA), root cause analysis (RCA), and maintenance documentation.\\n\\nRules:\\n1. ONLY answer based on the provided context documents.\\n2. If the context does not contain enough information, say \"I don't have sufficient information in the available documents to answer this question.\"\\n3. Always cite your sources by referencing the Source number and document name.\\n4. Be precise and concise. Use technical language appropriate for industrial/manufacturing environments.\\n5. If multiple sources provide conflicting information, note the discrepancy.\\n6. Never fabricate information not present in the context.`;\n\n  const userPrompt = `Context Documents:\\n${context}\\n\\n---\\n\\nUser Question: ${prevData.query || ''}\\n\\nProvide a precise answer based solely on the context above. Cite sources.`;\n\n  results.push({\n    json: {\n      ...prevData,\n      rerank_scores: rerankScores,\n      final_results: finalResults,\n      context: context,\n      system_prompt: systemPrompt,\n      user_prompt: userPrompt,\n      _metrics: {\n        ...(prevData._metrics || {}),\n        rerank_time: rerankTime,\n        rerank_latency_ms: rerankTime - ((prevData._metrics && prevData._metrics.vector_search_time) ? prevData._metrics.vector_search_time : rerankTime)\n      }\n    }\n  });\n}\n\nreturn results;\n"
+      },
+      "id": "b2000001-0001-4000-8000-000000000015",
+      "name": "Build_LLM_Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3340,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.user_prompt } ], temperature: 0.1, max_tokens: 1500, top_p: 0.95 }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000016",
+      "name": "Generate_Answer_LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3580,
+        440
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "OpenAI API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract LLM answer and perform hallucination check + confidence scoring\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const llmResp = item.json;\n  const prevItem = $('Build_LLM_Context').item;\n  const prevData = (prevItem && prevItem.json) ? prevItem.json : {};\n  const answerTime = Date.now();\n\n  // Extract answer text\n  let answerText = '';\n  let tokensUsed = 0;\n  if (llmResp.choices && llmResp.choices[0]) {\n    answerText = (llmResp.choices[0].message && llmResp.choices[0].message.content) ? llmResp.choices[0].message.content : '';\n    tokensUsed = (llmResp.usage && llmResp.usage.total_tokens) ? llmResp.usage.total_tokens : 0;\n  }\n\n  if (!answerText) {\n    throw new Error('LLM returned empty answer');\n  }\n\n  // === HALLUCINATION DETECTION ===\n  const context = prevData.context ? prevData.context.toLowerCase() : '';\n  const answer = answerText.toLowerCase();\n\n  const unsupportedPhrases = [\n    \"i don't have sufficient information\",\n    'not enough information',\n    'cannot find relevant',\n    'no relevant information',\n    'not available in the provided'\n  ];\n  const isUnsupported = unsupportedPhrases.some(p => answer.includes(p));\n\n  const answerSentences = answerText.split(/[.!?]+/).filter(s => s.trim().length > 20);\n  let supportedClaims = 0;\n  let totalClaims = 0;\n\n  for (const sentence of answerSentences) {\n    if (sentence.toLowerCase().includes('source') && sentence.includes('[')) continue;\n    totalClaims++;\n    const words = sentence.toLowerCase().split(/\\s+/).filter(w => w.length > 4);\n    const matchingWords = context ? words.filter(w => context.includes(w)) : [];\n    const coverage = words.length > 0 ? matchingWords.length / words.length : 0;\n    if (coverage > 0.3) supportedClaims++;\n  }\n\n  let confidenceScore = 0.0;\n  if (isUnsupported) {\n    confidenceScore = 0.0;\n  } else if (totalClaims === 0) {\n    confidenceScore = 0.5;\n  } else {\n    const claimSupport = supportedClaims / totalClaims;\n    const rerankScores = prevData.rerank_scores || [];\n    const avgRerankScore = rerankScores.length > 0\n      ? rerankScores.reduce((a, b) => a + (b || 0), 0) / rerankScores.length\n      : 0;\n    confidenceScore = Math.round((claimSupport * 0.6 + Math.min(avgRerankScore, 1) * 0.4) * 100) / 100;\n  }\n\n  const hallucinationFlag = !isUnsupported && totalClaims > 0 && (supportedClaims / totalClaims) < 0.4;\n  const costEstimate = tokensUsed * 0.00015 / 1000;\n\n  const prevMetrics = prevData._metrics || {};\n  const rerankTime = prevMetrics.rerank_time || answerTime;\n\n  results.push({\n    json: {\n      ...prevData,\n      answer: answerText,\n      confidence_score: confidenceScore,\n      hallucination_flag: hallucinationFlag,\n      is_unsupported: isUnsupported,\n      supported_claims: supportedClaims,\n      total_claims: totalClaims,\n      tokens_used: tokensUsed,\n      cost_estimate: costEstimate,\n      _metrics: {\n        ...prevMetrics,\n        answer_time: answerTime,\n        answer_generation_latency_ms: answerTime - rerankTime\n      }\n    }\n  });\n}\n\nreturn results;\n"
+      },
+      "id": "b2000001-0001-4000-8000-000000000017",
+      "name": "Hallucination_Check_And_Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3820,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://redis:6379",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ command: 'SETEX', args: [ 'ai_cache:' + Buffer.from($json.query).toString('base64').substring(0, 64), 3600, JSON.stringify({ answer: $json.answer, confidence_score: $json.confidence_score, sources: $json.final_results.map(r => ({ index: r.index, doc: r.payload?.file_name })) }) ] }) }}",
+        "options": {
+          "timeout": 2000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000018",
+      "name": "Cache_Result_Redis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4060,
+        440
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO retrieval_logs (query_text, user_id, user_role, process_line, shift, matched_doc_ids, matched_indexes, top_k_scores, rerank_scores, answer_text, confidence_score, hallucination_flag, cache_hit, total_latency_ms, embedding_latency_ms, vector_query_latency_ms, rerank_latency_ms, llm_latency_ms, tokens_used, cost_estimate) VALUES ($1, '{{ $('Hallucination_Check_And_Score').item.json.user_id }}', '{{ $('Hallucination_Check_And_Score').item.json.user_role }}', '{{ $('Hallucination_Check_And_Score').item.json.process_line }}', '{{ $('Hallucination_Check_And_Score').item.json.shift }}', ARRAY[{{ $('Hallucination_Check_And_Score').item.json.matched_doc_ids.map(d => \"'\" + d + \"'\").join(',') }}]::uuid[], ARRAY[{{ $('Hallucination_Check_And_Score').item.json.matched_indexes.map(i => \"'\" + i + \"'\").join(',') }}], ARRAY[{{ $('Hallucination_Check_And_Score').item.json.top_k_scores.join(',') }}], ARRAY[{{ $('Hallucination_Check_And_Score').item.json.rerank_scores.join(',') }}], $2, {{ $('Hallucination_Check_And_Score').item.json.confidence_score }}, {{ $('Hallucination_Check_And_Score').item.json.hallucination_flag }}, false, {{ Date.now() - $('Hallucination_Check_And_Score').item.json._metrics.start_time }}, {{ $('Hallucination_Check_And_Score').item.json._metrics.embedding_latency_ms || 0 }}, {{ $('Hallucination_Check_And_Score').item.json._metrics.vector_query_latency_ms || 0 }}, {{ $('Hallucination_Check_And_Score').item.json._metrics.rerank_latency_ms || 0 }}, {{ $('Hallucination_Check_And_Score').item.json._metrics.answer_generation_latency_ms || 0 }}, {{ $('Hallucination_Check_And_Score').item.json.tokens_used }}, {{ $('Hallucination_Check_And_Score').item.json.cost_estimate }});",
+        "options": {
+          "queryReplacement": "={{ [ $('Hallucination_Check_And_Score').item.json.query, $('Hallucination_Check_And_Score').item.json.answer ] }}"
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000019",
+      "name": "Store_Retrieval_Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4300,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute all query pipeline Prometheus metrics\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const d = item.json;\n  const metrics_data = d._metrics || {};\n  const endTime = Date.now();\n  const totalLatency = metrics_data.start_time ? (endTime - metrics_data.start_time) / 1000 : 0;\n  const embLatency = (metrics_data.embedding_latency_ms || 0) / 1000;\n  const vecLatency = (metrics_data.vector_query_latency_ms || 0) / 1000;\n  const rerankLatency = (metrics_data.rerank_latency_ms || 0) / 1000;\n  const answerLatency = (metrics_data.answer_generation_latency_ms || 0) / 1000;\n  const pl = d.process_line || 'all';\n  const shift = d.shift || 'unknown';\n  const queryId = (metrics_data.query_id) ? String(metrics_data.query_id) : 'unknown';\n  const matchedIndexes = Array.isArray(d.matched_indexes) ? d.matched_indexes : [];\n  const indexesLabel = matchedIndexes.length > 0 ? matchedIndexes.join(',') : 'none';\n\n  const buckets = [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60];\n  const histLine = (name, labels, val) => {\n    const lines = buckets.map(b => `${name}{${labels},le=\"${b}\"} ${val <= b ? 1 : 0}`);\n    lines.push(`${name}{${labels},le=\"+Inf\"} 1`);\n    lines.push(`${name}_sum{${labels}} ${val}`);\n    lines.push(`${name}_count{${labels}} 1`);\n    return lines.join('\\n');\n  };\n\n  const metrics = [\n    `# HELP ai_query_total Total queries`,\n    `# TYPE ai_query_total counter`,\n    `ai_query_total{cache=\"miss\",process_line=\"${pl}\",shift=\"${shift}\",role=\"${d.user_role || 'unknown'}\"} 1`,\n    ``,\n    `# HELP ai_query_latency_seconds Total query latency`,\n    `# TYPE ai_query_latency_seconds histogram`,\n    histLine('ai_query_latency_seconds', `process_line=\"${pl}\"`, totalLatency),\n    ``,\n    `# HELP ai_embedding_latency_seconds Embedding generation latency`,\n    `# TYPE ai_embedding_latency_seconds histogram`,\n    histLine('ai_embedding_latency_seconds', `model=\"text-embedding-3-large\"`, embLatency),\n    ``,\n    `# HELP ai_vector_query_latency_seconds Vector DB search latency`,\n    `# TYPE ai_vector_query_latency_seconds histogram`,\n    histLine('ai_vector_query_latency_seconds', `indexes=\"${indexesLabel}\"`, vecLatency),\n    ``,\n    `# HELP ai_rerank_latency_seconds Cross-encoder rerank latency`,\n    `# TYPE ai_rerank_latency_seconds histogram`,\n    histLine('ai_rerank_latency_seconds', `model=\"cross-encoder\"`, rerankLatency),\n    ``,\n    `# HELP ai_answer_generation_latency_seconds LLM answer generation latency`,\n    `# TYPE ai_answer_generation_latency_seconds histogram`,\n    histLine('ai_answer_generation_latency_seconds', `model=\"gpt-4o-mini\"`, answerLatency),\n    ``,\n    `# HELP ai_confidence_score Answer confidence score gauge`,\n    `# TYPE ai_confidence_score gauge`,\n    `ai_confidence_score{process_line=\"${pl}\",query_id=\"${queryId}\"} ${d.confidence_score || 0}`,\n    ``,\n    `# HELP ai_hallucination_flag_total Hallucination flags`,\n    `# TYPE ai_hallucination_flag_total counter`,\n    `ai_hallucination_flag_total{process_line=\"${pl}\"} ${d.hallucination_flag ? 1 : 0}`,\n    ``,\n    `# HELP ai_unsupported_answers_total Unsupported answers`,\n    `# TYPE ai_unsupported_answers_total counter`,\n    `ai_unsupported_answers_total{process_line=\"${pl}\"} ${d.is_unsupported ? 1 : 0}`,\n    ``,\n    `# HELP ai_retrieval_from_superseded_total Superseded docs filtered`,\n    `# TYPE ai_retrieval_from_superseded_total counter`,\n    `ai_retrieval_from_superseded_total{} ${d.superseded_filtered || 0}`,\n    ``\n  ].join('\\n');\n\n  results.push({\n    json: {\n      ...d,\n      _prometheus_metrics: metrics,\n      _total_latency_seconds: totalLatency\n    }\n  });\n}\n\nreturn results;\n"
+      },
+      "id": "b2000001-0001-4000-8000-000000000020",
+      "name": "Compute_Query_Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4540,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pushgateway:9091/metrics/job/ai_query_pipeline/instance/n8n",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json._prometheus_metrics }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000021",
+      "name": "Push_Query_Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4780,
+        440
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, query_id: $json._metrics.query_id, answer: $json.answer, confidence_score: $json.confidence_score, hallucination_flag: $json.hallucination_flag, sources: ($json.final_results || []).map(r => ({ index: r.index, document: r.payload?.file_name, process_line: r.payload?.process_line, score: r.score })), latency_seconds: $json._total_latency_seconds, cache_hit: false }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000022",
+      "name": "Respond_Answer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        5020,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pushgateway:9091/metrics/job/ai_query_pipeline/instance/n8n",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json._prometheus_metrics }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000023",
+      "name": "Push_Cache_Hit_Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2380,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, answer: $json.answer, confidence_score: $json.confidence_score, sources: $json.sources || [], latency_seconds: $json.latency_seconds, cache_hit: true }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000024",
+      "name": "Respond_Cached",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2620,
+        160
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "b2000001-0001-4000-8000-000000000025",
+      "name": "Error_Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle query errors: RBAC rejections, prompt injection, general errors\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const error = item.json;\n  const errorMsg = error.message || error.error?.message || 'Unknown query error';\n  const nodeName = error.node?.name || error.workflow?.lastNodeExecuted || 'unknown';\n\n  let eventType = 'query_error';\n  let metricsLines = [];\n\n  if (errorMsg.includes('RBAC_REJECTION')) {\n    eventType = 'rbac_rejection';\n    metricsLines = [\n      `# HELP ai_rbac_rejections_total RBAC access rejections`,\n      `# TYPE ai_rbac_rejections_total counter`,\n      `ai_rbac_rejections_total{reason=\"${errorMsg.substring(16, 80).replace(/\"/g, '')}\"} 1`\n    ];\n  } else if (errorMsg.includes('CROSS_PROCESS_ACCESS')) {\n    eventType = 'cross_process_access';\n    metricsLines = [\n      `# HELP ai_cross_process_access_attempts_total Cross-process access attempts`,\n      `# TYPE ai_cross_process_access_attempts_total counter`,\n      `ai_cross_process_access_attempts_total{} 1`\n    ];\n  } else if (errorMsg.includes('PROMPT_INJECTION')) {\n    eventType = 'prompt_injection';\n    metricsLines = [\n      `# HELP ai_prompt_injection_attempts_total Prompt injection attempts`,\n      `# TYPE ai_prompt_injection_attempts_total counter`,\n      `ai_prompt_injection_attempts_total{} 1`\n    ];\n  } else if (errorMsg.includes('UNAUTHORIZED')) {\n    eventType = 'jwt_invalid';\n    metricsLines = [\n      `# HELP ai_auth_failures_total Authentication failures`,\n      `# TYPE ai_auth_failures_total counter`,\n      `ai_auth_failures_total{reason=\"jwt_invalid\"} 1`\n    ];\n  } else {\n    metricsLines = [\n      `# HELP ai_query_errors_total Query processing errors`,\n      `# TYPE ai_query_errors_total counter`,\n      `ai_query_errors_total{stage=\"${nodeName}\",error_type=\"${errorMsg.substring(0, 50).replace(/\"/g, '')}\"} 1`\n    ];\n  }\n\n  const metrics = metricsLines.join('\\n') + '\\n';\n\n  results.push({\n    json: {\n      error_message: errorMsg,\n      event_type: eventType,\n      error_node: nodeName,\n      timestamp: new Date().toISOString(),\n      _prometheus_metrics: metrics\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "b2000001-0001-4000-8000-000000000026",
+      "name": "Query_Error_Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pushgateway:9091/metrics/job/ai_query_security/instance/n8n",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json._prometheus_metrics }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "b2000001-0001-4000-8000-000000000027",
+      "name": "Push_Security_Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO security_audit_log (event_type, user_id, user_role, details) VALUES ('{{ $json.event_type }}', 'unknown', 'unknown', '{{ JSON.stringify({ error: $json.error_message, node: $json.error_node, timestamp: $json.timestamp }) }}'::jsonb);",
+        "options": {}
+      },
+      "id": "b2000001-0001-4000-8000-000000000028",
+      "name": "Log_Security_Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        940,
+        700
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "8Ec7jAtqlTk36p1i",
+          "name": "PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook_Query": {
+      "main": [
+        [
+          {
+            "node": "Parse_Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse_Request": {
+      "main": [
+        [
+          {
+            "node": "Validate_JWT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate_JWT": {
+      "main": [
+        [
+          {
+            "node": "Enforce_RBAC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enforce_RBAC": {
+      "main": [
+        [
+          {
+            "node": "Detect_Prompt_Injection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect_Prompt_Injection": {
+      "main": [
+        [
+          {
+            "node": "Check_Redis_Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check_Redis_Cache": {
+      "main": [
+        [
+          {
+            "node": "Evaluate_Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate_Cache": {
+      "main": [
+        [
+          {
+            "node": "Cache_Hit_Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache_Hit_Check": {
+      "main": [
+        [
+          {
+            "node": "Return_Cached_Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate_Query_Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Return_Cached_Answer": {
+      "main": [
+        [
+          {
+            "node": "Push_Cache_Hit_Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push_Cache_Hit_Metrics": {
+      "main": [
+        [
+          {
+            "node": "Respond_Cached",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate_Query_Embedding": {
+      "main": [
+        [
+          {
+            "node": "Prepare_Multi_Index_Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare_Multi_Index_Search": {
+      "main": [
+        [
+          {
+            "node": "Vector_Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vector_Search": {
+      "main": [
+        [
+          {
+            "node": "Merge_Filter_Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge_Filter_Results": {
+      "main": [
+        [
+          {
+            "node": "Cross_Encoder_Rerank",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cross_Encoder_Rerank": {
+      "main": [
+        [
+          {
+            "node": "Build_LLM_Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_LLM_Context": {
+      "main": [
+        [
+          {
+            "node": "Generate_Answer_LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate_Answer_LLM": {
+      "main": [
+        [
+          {
+            "node": "Hallucination_Check_And_Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hallucination_Check_And_Score": {
+      "main": [
+        [
+          {
+            "node": "Cache_Result_Redis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache_Result_Redis": {
+      "main": [
+        [
+          {
+            "node": "Store_Retrieval_Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store_Retrieval_Log": {
+      "main": [
+        [
+          {
+            "node": "Compute_Query_Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute_Query_Metrics": {
+      "main": [
+        [
+          {
+            "node": "Push_Query_Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push_Query_Metrics": {
+      "main": [
+        [
+          {
+            "node": "Respond_Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error_Trigger": {
+      "main": [
+        [
+          {
+            "node": "Query_Error_Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query_Error_Handler": {
+      "main": [
+        [
+          {
+            "node": "Push_Security_Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push_Security_Metrics": {
+      "main": [
+        [
+          {
+            "node": "Log_Security_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "enterprise-ai"
+    },
+    {
+      "name": "query-pipeline"
+    },
+    {
+      "name": "production"
+    }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "versionId": "query-pipeline-v1.0.0"
+}
